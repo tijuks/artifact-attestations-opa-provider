@@ -97,6 +97,9 @@ func main() {
 	}
 	var sm = http.NewServeMux()
 	sm.HandleFunc("/", t.validate)
+	sm.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 
 	// Handle signals gracefully to avoid dropping requests during Pod shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
