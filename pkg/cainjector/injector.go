@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
 	"os"
-	"path"
 	"time"
 
 	"github.com/open-policy-agent/frameworks/constraint/pkg/apis/externaldata/v1beta1"
@@ -18,70 +18,63 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
 )
+
+var propagationDelay = 10 * time.Second
 
 // UpdateCABundle ensures that the `caBundle` field in the Provider object contains the CA certificates in $certsDir/ca.crt.
 // If the field is already up to date, no changes are made.
 // If an update is made, it sleeps for 10 seconds to allow Gatekeeper to pick up the changes.
 // UpdateCABundle removes expired certificates to prevent the bundle from growing indefinitely.
-func UpdateCABundle(ctx context.Context, certsDir *string) error {
-	if err := v1beta1.AddToScheme(scheme.Scheme); err != nil {
-		return err
-	}
-
-	clusterConfig, err := rest.InClusterConfig()
-	if err != nil {
-		return err
-	}
-
-	unstructuredClient, err := dynamic.NewForConfig(clusterConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create in-cluster kubernetes client: %w", err)
-	}
-
-	provider, err := getProvider(ctx, unstructuredClient)
+func UpdateCABundle(ctx context.Context, k8sClient dynamic.Interface, bundlePath string) error {
+	provider, err := getProvider(ctx, k8sClient)
 	if err != nil {
 		return fmt.Errorf("failed to get Provider object: %w", err)
 	}
 
-	caBundle, err := os.ReadFile(path.Join(*certsDir, "ca.crt"))
+	caBundle, err := os.ReadFile(bundlePath)
 	if err != nil {
 		return fmt.Errorf("failed to read CA bundle: %w", err)
 	}
 
-	newBundle, err := mergeCertBundles([]byte(provider.Spec.CABundle), caBundle)
+	newBundle, err := mergeAndEncode(provider.Spec.CABundle, caBundle)
 	if err != nil {
 		return fmt.Errorf("failed to append CA certificates to bundle: %w", err)
 	}
 
-	if provider.Spec.CABundle == string(newBundle) {
+	if provider.Spec.CABundle == newBundle {
 		log.Println("CA bundle is already up to date, no changes made.")
 		return nil
 	}
 
-	if err = updateProvider(ctx, provider, newBundle, unstructuredClient); err != nil {
+	if err = updateProvider(ctx, k8sClient, provider, newBundle); err != nil {
 		return fmt.Errorf("failed to update Provider object: %w", err)
 	}
 
 	log.Println("Successfully updated CA bundle in Provider object.")
 	log.Println("Sleeping for 10s to allow Gatekeeper to pick up the changes...")
-	time.Sleep(10 * time.Second)
+	time.Sleep(propagationDelay)
 	log.Println("Done")
 
 	return nil
 }
 
-func mergeCertBundles(bundle0 []byte, bundle1 []byte) ([]byte, error) {
-	certs0, err := parseCertificates(bundle0)
+// mergeAndEncode an additional PEM-encoded cert bundle with an base64 andPEM-encoded certificate bundle,
+// It also removes duplicates and expired certificates.
+func mergeAndEncode(encodedBundle string, additional []byte) (string, error) {
+	bundle0, err := base64.StdEncoding.DecodeString(encodedBundle)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse first certificate bundle: %w", err)
+		return "", fmt.Errorf("failed to decode existing CA bundle: %w", err)
 	}
 
-	certs1, err := parseCertificates(bundle1)
+	certs0, err := parseCertificates(bundle0)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse second certificate bundle: %w", err)
+		return "", fmt.Errorf("failed to parse first certificate bundle: %w", err)
+	}
+
+	certs1, err := parseCertificates(additional)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse second certificate bundle: %w", err)
 	}
 
 	// Merge certificates and track unique ones by their DER encoding
@@ -105,16 +98,16 @@ func mergeCertBundles(bundle0 []byte, bundle1 []byte) ([]byte, error) {
 				Type:  "CERTIFICATE",
 				Bytes: cert.Raw,
 			}); err != nil {
-				return nil, fmt.Errorf("failed to encode certificate to PEM: %w", err)
+				return "", fmt.Errorf("failed to encode certificate to PEM: %w", err)
 			}
 		}
 	}
 
 	if buffer.Len() == 0 {
-		return nil, errors.New("resulting CA bundle is empty after removing expired certificates")
+		return "", errors.New("resulting CA bundle is empty after removing expired certificates")
 	}
 
-	return buffer.Bytes(), nil
+	return base64.StdEncoding.EncodeToString(buffer.Bytes()), nil
 }
 
 func parseCertificates(bundle []byte) ([]*x509.Certificate, error) {
@@ -138,8 +131,8 @@ func parseCertificates(bundle []byte) ([]*x509.Certificate, error) {
 	return certs, nil
 }
 
-func updateProvider(ctx context.Context, provider *v1beta1.Provider, bundle []byte, client *dynamic.DynamicClient) error {
-	provider.Spec.CABundle = string(bundle)
+func updateProvider(ctx context.Context, client dynamic.Interface, provider *v1beta1.Provider, bundle string) error {
+	provider.Spec.CABundle = bundle
 
 	updatedUnstructured, err := runtime.DefaultUnstructuredConverter.ToUnstructured(provider)
 	if err != nil {
@@ -158,7 +151,7 @@ func updateProvider(ctx context.Context, provider *v1beta1.Provider, bundle []by
 	return nil
 }
 
-func getProvider(ctx context.Context, client *dynamic.DynamicClient) (*v1beta1.Provider, error) {
+func getProvider(ctx context.Context, client dynamic.Interface) (*v1beta1.Provider, error) {
 	rawProvider, err := client.Resource(schema.GroupVersionResource{
 		Group:    "externaldata.gatekeeper.sh",
 		Version:  "v1beta1",
